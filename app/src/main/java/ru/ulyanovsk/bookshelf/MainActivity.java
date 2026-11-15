@@ -24,7 +24,8 @@ import org.w3c.dom.Node;
 import org.w3c.dom.NodeList;
 
 import javax.xml.parsers.DocumentBuilderFactory;
-import javax.xml.XMLConstants;
+import javax.xml.parsers.DocumentBuilder;
+import org.xml.sax.SAXException;
 import java.io.BufferedInputStream;
 import java.io.BufferedOutputStream;
 import java.io.ByteArrayOutputStream;
@@ -168,14 +169,23 @@ public class MainActivity extends Activity {
         return m.find()?m.group(1).toUpperCase(Locale.ROOT):"";
     }
     private JSONObject parseCatalog(byte[] raw,String source) throws Exception{
+        // Android's DocumentBuilderFactory does NOT implement
+        // XMLConstants.FEATURE_SECURE_PROCESSING or all Apache/SAX feature flags.
+        // Reject document type declarations before parsing and block any external
+        // entity resolution, while retaining normal Atom/OPDS namespace support.
+        // The caller already enforces a 3 MiB upper bound for the XML document.
+        String declarationScan = new String(raw,StandardCharsets.ISO_8859_1).replace("\u0000", "");
+        if(Pattern.compile("(?i)<!\\s*(?:DOCTYPE|ENTITY)\\b").matcher(declarationScan).find())
+            throw new Exception("Каталог содержит запрещённые XML DTD/ENTITY-объявления");
+
         DocumentBuilderFactory factory=DocumentBuilderFactory.newInstance();
         factory.setNamespaceAware(true);
-        factory.setFeature(XMLConstants.FEATURE_SECURE_PROCESSING,true);
-        factory.setFeature("http://apache.org/xml/features/disallow-doctype-decl",true);
-        factory.setFeature("http://xml.org/sax/features/external-general-entities",false);
-        factory.setFeature("http://xml.org/sax/features/external-parameter-entities",false);
-        factory.setXIncludeAware(false);factory.setExpandEntityReferences(false);
-        Document doc=factory.newDocumentBuilder().parse(new java.io.ByteArrayInputStream(raw));
+        factory.setExpandEntityReferences(false);
+        DocumentBuilder builder=factory.newDocumentBuilder();
+        builder.setEntityResolver((publicId,systemId)->{
+            throw new SAXException("Внешние XML-сущности запрещены");
+        });
+        Document doc=builder.parse(new java.io.ByteArrayInputStream(raw));
         Element root=doc.getDocumentElement();
         if(!NS.equals(root.getNamespaceURI())||!("feed".equals(root.getLocalName())||"entry".equals(root.getLocalName())))throw new Exception("Источник вернул не OPDS-каталог");
         JSONObject result=new JSONObject();result.put("title",childText(root,"title"));result.put("next",JSONObject.NULL);result.put("items",new JSONArray());
