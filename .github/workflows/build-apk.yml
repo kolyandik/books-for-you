@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
 
     steps:
@@ -23,24 +23,29 @@ jobs:
           distribution: temurin
           java-version: '17'
 
-      - name: Установить Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Установить Android API 35
-        run: sdkmanager 'platforms;android-35' 'build-tools;35.0.0'
+      - name: Проверить предустановленный Android SDK
+        run: |
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          test -d "$ANDROID_HOME/platforms/android-35" || { echo 'Нет Android SDK API 35'; exit 1; }
+          test -d "$ANDROID_HOME/build-tools/35.0.0" || { echo 'Нет Build Tools 35.0.0'; exit 1; }
+          echo 'Android SDK API 35 и Build Tools 35.0.0 найдены'
 
       - name: Установить Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.10.2'
 
-      - name: Проверить проект
-        run: python3 check_project.py
+      - name: Проверить исходники
+        run: |
+          test -f build.gradle || { echo 'В корне нет build.gradle'; exit 1; }
+          test -f app/build.gradle || { echo 'Нет app/build.gradle'; exit 1; }
+          test -f check_project.py || { echo 'Нет check_project.py'; exit 1; }
+          python3 check_project.py
 
       - name: Собрать APK
         run: gradle --no-daemon --stacktrace assembleDebug
 
-      - name: Сохранить APK
+      - name: Сохранить установочный APK
         uses: actions/upload-artifact@v4
         with:
           name: Knizhnaya-Polka-install-APK
