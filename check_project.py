@@ -26,3 +26,15 @@ assert 'EXTERNAL_CONTENT_URI' in java
 assert 'file:///android_asset/index.html' in java
 assert 'applicationId' in (root/'app/build.gradle').read_text(encoding='utf-8')
 print('Проверка структуры Android-проекта пройдена. Это не компиляция APK.')
+
+# JavaScript syntax check (Node.js is available on GitHub's Ubuntu runner).
+import subprocess
+import tempfile
+start = html.index('<script>')+len('<script>')
+end = html.index('</script>',start)
+with tempfile.NamedTemporaryFile(mode='w',suffix='.js',encoding='utf-8') as f:
+    f.write(html[start:end]); f.flush()
+    subprocess.run(['node','--check',f.name],check=True)
+assert 'void selfTest(' in java and 'void diagnose(' in java
+assert 'copyPickedFile(' in java
+print('Проверка JavaScript и функций диагностики пройдена.')
