@@ -4,6 +4,8 @@ import android.app.Activity;
 import android.os.Bundle;
 import android.os.Environment;
 import android.content.Intent;
+import android.database.Cursor;
+import android.provider.OpenableColumns;
 import android.content.ContentValues;
 import android.net.Uri;
 import android.provider.MediaStore;
@@ -33,6 +35,11 @@ import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
+import java.net.UnknownHostException;
+import java.net.SocketTimeoutException;
+import java.net.ConnectException;
+import javax.net.ssl.SSLException;
+import java.io.IOException;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
 import java.nio.charset.Charset;
@@ -55,6 +62,7 @@ public class MainActivity extends Activity {
     private final ExecutorService io = Executors.newFixedThreadPool(3);
     private static final String NS="http://www.w3.org/2005/Atom";
     private static final int MAX_CATALOG=3*1024*1024;
+    private static final int FILE_PICKER=716;
     private static final int MAX_BOOK=70*1024*1024;
     private static final Set<String> HOSTS=new HashSet<>(Arrays.asList("http.flibusta.is", "flibusta.is", "www.flibusta.is", "flub.flibusta.is"));
 
@@ -74,7 +82,7 @@ public class MainActivity extends Activity {
         web.setWebChromeClient(new WebChromeClient());
         web.setWebViewClient(new WebViewClient(){
             @Override public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request){
-                return !"file".equalsIgnoreCase(request.getUrl().getScheme());
+                return !"file:///android_asset/index.html".equals(request.getUrl().toString());
             }
             @Override public boolean shouldOverrideUrlLoading(WebView view, String url) {
                 return !url.startsWith("file:///android_asset/");
@@ -91,7 +99,15 @@ public class MainActivity extends Activity {
         web.evaluateJavascript("window.mobileBack && window.mobileBack()",null);
     }
 
-    private String base(){ return getPreferences(0).getString("host","https://http.flibusta.is"); }
+    private String base(){ return getPreferences(0).getString("host","https://flibusta.is"); }
+    private static String friendly(Exception e){
+        if(e instanceof UnknownHostException) return "Сервер не найден (DNS). Проверьте адрес источника и интернет.";
+        if(e instanceof SocketTimeoutException) return "Источник слишком долго не отвечает. Каталог или выдача книги на сервере недоступны.";
+        if(e instanceof SSLException) return "Ошибка защищённого соединения HTTPS: "+e.getClass().getSimpleName();
+        if(e instanceof ConnectException) return "Соединение отклонено. Источник не принимает подключения.";
+        String m=e.getMessage();
+        return m==null||m.trim().isEmpty()?"Ошибка соединения: "+e.getClass().getSimpleName():m;
+    }
     private void reply(String id, boolean ok, Object data){
         try {
             JSONObject output=new JSONObject(); output.put("ok",ok); output.put("data",data);
@@ -116,20 +132,35 @@ public class MainActivity extends Activity {
         return u;
     }
     private HttpURLConnection connection(URL url,boolean catalog) throws Exception {
-        for(int i=0;i<5;i++){
+        int redirects=0, retries=0;
+        while(redirects<5){
             URL validated=checked(url.toString(),catalog);
             HttpURLConnection c=(HttpURLConnection)validated.openConnection();
             c.setInstanceFollowRedirects(false);
-            c.setConnectTimeout(11000); c.setReadTimeout(19000);
-            c.setRequestProperty("User-Agent","BookShelf-Ulyanovsk-Android/1.0");
-            c.setRequestProperty("Accept",catalog?"application/atom+xml, application/xml, text/xml, */*;q=0.6":"*/*");
-            int status=c.getResponseCode();
+            c.setConnectTimeout(12000); c.setReadTimeout(25000);
+            c.setRequestProperty("User-Agent","BookShelf-Ulyanovsk/1.1 (Android; OPDS Reader)");
+            c.setRequestProperty("Accept-Encoding","identity");
+            c.setRequestProperty("Accept",catalog?"application/atom+xml, application/xml, text/xml;q=0.9, */*;q=0.3":"application/octet-stream, */*;q=0.7");
+            final int status;
+            try{status=c.getResponseCode();}
+            catch(SocketTimeoutException e){
+                c.disconnect();
+                if(retries++<1){Thread.sleep(700);continue;}
+                throw e;
+            }
             if(status>=300 && status<400){
                 String loc=c.getHeaderField("Location"); c.disconnect();
                 if(loc==null)throw new Exception("Источник перенаправил запрос без адреса");
-                url=new URL(validated,loc); continue;
+                url=new URL(validated,loc); redirects++; continue;
             }
-            if(status<200||status>=300){c.disconnect();throw new Exception("Источник ответил HTTP "+status+". Возможно, он недоступен.");}
+            if(status==429||status==502||status==503||status==504){
+                c.disconnect();
+                if(retries++<1){Thread.sleep(800);continue;}
+                throw new Exception("Сервер временно не отдаёт "+(catalog?"каталог":"книгу")+" (HTTP "+status+"). Повторите позже.");
+            }
+            if(status==401||status==403){c.disconnect();throw new Exception("Источник ограничил доступ (HTTP "+status+"). Возможно, требуется вход или книга недоступна.");}
+            if(status==404||status==410){c.disconnect();throw new Exception("Книга или раздел отсутствует на сервере (HTTP "+status+").");}
+            if(status<200||status>=300){c.disconnect();throw new Exception("Источник ответил HTTP "+status+".");}
             return c;
         }
         throw new Exception("Слишком много перенаправлений");
@@ -168,78 +199,101 @@ public class MainActivity extends Activity {
         Matcher m=Pattern.compile("(?i)/(fb2|epub|mobi|pdf|txt|rtf|html|djvu)(?:[?#]|$)").matcher(url);
         return m.find()?m.group(1).toUpperCase(Locale.ROOT):"";
     }
+    private static boolean isAtom(Element e,String name){
+        return NS.equals(e.getNamespaceURI())&&name.equals(e.getLocalName());
+    }
+    private static String atomChild(Element e,String name){
+        for(Node n=e.getFirstChild();n!=null;n=n.getNextSibling()){
+            if(n instanceof Element && isAtom((Element)n,name))return n.getTextContent().trim();
+        }
+        return "";
+    }
     private JSONObject parseCatalog(byte[] raw,String source) throws Exception{
-        // Android's DocumentBuilderFactory does NOT implement
-        // XMLConstants.FEATURE_SECURE_PROCESSING or all Apache/SAX feature flags.
-        // Reject document type declarations before parsing and block any external
-        // entity resolution, while retaining normal Atom/OPDS namespace support.
-        // The caller already enforces a 3 MiB upper bound for the XML document.
-        String declarationScan = new String(raw,StandardCharsets.ISO_8859_1).replace("\u0000", "");
-        if(Pattern.compile("(?i)<!\\s*(?:DOCTYPE|ENTITY)\\b").matcher(declarationScan).find())
-            throw new Exception("Каталог содержит запрещённые XML DTD/ENTITY-объявления");
-
+        String scan=new String(raw,StandardCharsets.ISO_8859_1).replace(String.valueOf((char)0), "");
+        if(Pattern.compile("(?i)<!\\s*(?:DOCTYPE|ENTITY)\\b").matcher(scan).find())
+            throw new Exception("В XML обнаружены запрещённые декларации DTD/ENTITY");
         DocumentBuilderFactory factory=DocumentBuilderFactory.newInstance();
-        factory.setNamespaceAware(true);
-        factory.setExpandEntityReferences(false);
+        factory.setNamespaceAware(true);factory.setExpandEntityReferences(false);
         DocumentBuilder builder=factory.newDocumentBuilder();
-        builder.setEntityResolver((publicId,systemId)->{
-            throw new SAXException("Внешние XML-сущности запрещены");
-        });
+        builder.setEntityResolver((publicId,systemId)->{throw new SAXException("Внешние XML-сущности запрещены");});
         Document doc=builder.parse(new java.io.ByteArrayInputStream(raw));
         Element root=doc.getDocumentElement();
-        if(!NS.equals(root.getNamespaceURI())||!("feed".equals(root.getLocalName())||"entry".equals(root.getLocalName())))throw new Exception("Источник вернул не OPDS-каталог");
-        JSONObject result=new JSONObject();result.put("title",childText(root,"title"));result.put("next",JSONObject.NULL);result.put("items",new JSONArray());
+        if(!NS.equals(root.getNamespaceURI())||!("feed".equals(root.getLocalName())||"entry".equals(root.getLocalName())))
+            throw new Exception("Сервер вернул не OPDS XML. Возможно, это страница ошибки или блокировки.");
+        JSONObject result=new JSONObject();
+        result.put("title",atomChild(root,"title"));result.put("next",JSONObject.NULL);
+        JSONArray items=new JSONArray();result.put("items",items);
         URL sourceUrl=new URL(source);
-        if("feed".equals(root.getLocalName())){
-            NodeList rootNodes=root.getChildNodes();
-            for(int i=0;i<rootNodes.getLength();i++){
-                Node node=rootNodes.item(i);
-                if(!(node instanceof Element))continue;
-                Element link=(Element)node;
-                if(!"link".equals(link.getLocalName()))continue;
-                if("next".equals(link.getAttribute("rel"))){
-                    try{result.put("next",checked(new URL(sourceUrl,link.getAttribute("href")).toString(),true).toString());}
+        if(isAtom(root,"feed")){
+            for(Node n=root.getFirstChild();n!=null;n=n.getNextSibling()){
+                if(!(n instanceof Element))continue;
+                Element e=(Element)n;
+                if(isAtom(e,"link")&&"next".equals(e.getAttribute("rel"))){
+                    try{result.put("next",checked(new URL(sourceUrl,e.getAttribute("href")).toString(),true).toString());}
                     catch(Exception ignored){}
                 }
             }
         }
-        NodeList entryNodes=root.getElementsByTagNameNS(NS,"entry");
-        for(int i=0;i<entryNodes.getLength() && i<100;i++){
-            Element entry=(Element)entryNodes.item(i);
+        NodeList entries=isAtom(root,"entry")?null:root.getElementsByTagNameNS(NS,"entry");
+        int count=entries==null?1:Math.min(entries.getLength(),100);
+        for(int i=0;i<count;i++){
+            Element entry=entries==null?root:(Element)entries.item(i);
             JSONObject book=new JSONObject();
-            book.put("title",childText(entry,"title"));
-            NodeList names=entry.getElementsByTagNameNS(NS,"name");
-            StringBuilder authors=new StringBuilder();
-            for(int k=0;k<names.getLength();k++){if(k>0)authors.append(", ");authors.append(names.item(k).getTextContent().trim());}
-            book.put("author",authors.toString());
-            String summary=childText(entry,"summary");if(summary.isEmpty())summary=childText(entry,"content");
-            book.put("summary",clean(summary).substring(0,Math.min(4000,clean(summary).length())));
-            JSONArray formats=new JSONArray();String nav="",site="",bookId="";
-            NodeList links=entry.getElementsByTagNameNS(NS,"link");
-            for(int j=0;j<links.getLength();j++){
-                Element l=(Element)links.item(j);
-                String href=l.getAttribute("href");if(href.isEmpty())continue;
-                String rel=l.getAttribute("rel");String type=l.getAttribute("type");
-                String absolute;
-                try {absolute=new URL(sourceUrl,href).toString();checked(absolute,false);}
-                catch(Exception e){
-                    try{absolute=new URL(sourceUrl,href).toString();checked(absolute,true);}catch(Exception ignored){continue;}
-                }
-                Matcher matched=Pattern.compile("/b/(\\d+)").matcher(absolute);
-                if(matched.find())bookId=matched.group(1);
-                if("alternate".equals(rel)&&absolute.contains("/b/"))site=absolute;
-                if(type.toLowerCase(Locale.ROOT).contains("application/atom+xml")||"subsection".equals(rel)||"collection".equals(rel)){
-                    try{checked(absolute,true);nav=absolute;}catch(Exception ignored){}
-                }
-                String f=fmt(type,absolute);
-                if((rel.contains("acquisition")||!f.isEmpty())&&!f.isEmpty()){
-                    try{checked(absolute,false);JSONObject option=new JSONObject();option.put("format",f);option.put("url",absolute);formats.put(option);}
-                    catch(Exception ignored){}
+            book.put("title",atomChild(entry,"title"));
+            String author="";
+            for(Node n=entry.getFirstChild();n!=null;n=n.getNextSibling()){
+                if(n instanceof Element && isAtom((Element)n,"author")){
+                    String name=atomChild((Element)n,"name");
+                    if(!name.isEmpty())author+=(author.isEmpty()?"":", ")+name;
                 }
             }
+            book.put("author",author);
+            String summary=atomChild(entry,"summary");
+            if(summary.isEmpty())summary=atomChild(entry,"content");
+            String description=clean(summary);book.put("summary",description.substring(0,Math.min(4000,description.length())));
+            JSONArray formats=new JSONArray();String nav="",site="",bookId="";
+            Matcher tagId=Pattern.compile("(?:tag:book:|/b/)(\\d{3,})").matcher(atomChild(entry,"id"));
+            if(tagId.find())bookId=tagId.group(1);
+            for(Node n=entry.getFirstChild();n!=null;n=n.getNextSibling()){
+                if(!(n instanceof Element)||!isAtom((Element)n,"link"))continue;
+                Element l=(Element)n;
+                String href=l.getAttribute("href");if(href.isEmpty())continue;
+                String rel=l.getAttribute("rel"),type=l.getAttribute("type"),linkTitle=l.getAttribute("title");
+                String absolute;
+                try{absolute=new URL(sourceUrl,href).toString();}
+                catch(Exception e){continue;}
+                Matcher matcher=Pattern.compile("/b/(\\d+)(?:/|$)").matcher(absolute);
+                if(matcher.find())bookId=matcher.group(1);
+                if(("alternate".equals(rel)||linkTitle.contains("Книга на сайте")) && matcher.find(0)){
+                    try{URL url=new URL(absolute);if(HOSTS.contains(url.getHost().toLowerCase(Locale.ROOT)))site=absolute;}
+                    catch(Exception ignored){}
+                }
+                if((type.toLowerCase(Locale.ROOT).contains("application/atom+xml")&&
+                   ("subsection".equals(rel)||"collection".equals(rel)||"alternate".equals(rel))) ||
+                   "subsection".equals(rel)||"collection".equals(rel)){
+                    try{nav=checked(absolute,true).toString();}catch(Exception ignored){}
+                }
+                String f=fmt(type,absolute);
+                if(f.isEmpty()&&rel.contains("acquisition"))f=fmt(linkTitle,absolute);
+                if((rel.contains("acquisition")||(!f.isEmpty()&&!"alternate".equals(rel)))&&!f.isEmpty()){
+                    try{
+                        checked(absolute,false);
+                        JSONObject opt=new JSONObject();opt.put("format",f);opt.put("url",absolute);
+                        formats.put(opt);
+                    }catch(Exception ignored){}
+                }
+            }
+            // The OPDS entry may be a catalog item with no acquisition links.
+            // Keep its details link instead of presenting a broken empty book card.
+            if(nav.isEmpty() && !bookId.isEmpty() && formats.length()==0){
+                try{nav=checked(new URL(sourceUrl,"/opds/book/"+bookId).toString(),true).toString();}
+                catch(Exception ignored){}
+            }
             book.put("formats",formats);book.put("navigation",nav);
-            book.put("id",bookId);book.put("site",site);book.put("kind",(formats.length()>0||!bookId.isEmpty())?"book":"section");
-            ((JSONArray)result.get("items")).put(book);
+            book.put("id",bookId);book.put("site",site);
+            boolean section=formats.length()==0 && bookId.isEmpty() && !nav.isEmpty();
+            book.put("kind",section?"section":"book");
+            items.put(book);
         }
         return result;
     }
@@ -248,9 +302,46 @@ public class MainActivity extends Activity {
         HttpURLConnection conn=connection(url,true);
         try {if(conn.getContentLengthLong()>MAX_CATALOG)throw new Exception("Каталог слишком большой");
             byte[] raw=bytes(conn.getInputStream(),MAX_CATALOG);
+            String contentType=conn.getContentType();
+            if(contentType!=null&&contentType.toLowerCase(Locale.ROOT).contains("text/html"))
+                throw new Exception("Сервер отдал HTML вместо каталога OPDS — это может быть страница ошибки или ограничения доступа.");
             if(raw.length<30)throw new Exception("Пустой ответ каталога");
             return parseCatalog(raw,conn.getURL().toString()).toString();
         } finally {conn.disconnect();}
+    }
+    private JSONObject diagnose() throws Exception{
+        JSONObject r=new JSONObject();r.put("host",base());
+        URL u=checked("/opds",true);
+        try{
+            HttpURLConnection c=connection(u,true);
+            try{
+                String mime=c.getContentType();
+                byte[] b=bytes(c.getInputStream(),MAX_CATALOG);
+                r.put("bytes",b.length);r.put("type",mime==null?"":mime);
+                if(b.length<30)throw new Exception("Сервер вернул пустой каталог");
+                JSONObject parsed=parseCatalog(b,c.getURL().toString());
+                r.put("entries",parsed.getJSONArray("items").length());
+                r.put("status","OPDS-каталог отвечает. Доступность отдельных книг проверяется при загрузке.");
+                return r;
+            }finally{c.disconnect();}
+        }catch(Exception e){throw new Exception("Проверка "+base()+"/opds: "+friendly(e));}
+    }
+    private JSONObject selfTest() throws Exception{
+        String xml="<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
+            +"<feed xmlns=\"http://www.w3.org/2005/Atom\"><title>Тестовый каталог</title>"
+            +"<entry><id>tag:book:123456</id><title>Тестовая книга</title>"
+            +"<author><name>Тестовый автор</name></author>"
+            +"<link rel=\"http://opds-spec.org/acquisition\" type=\"application/epub+zip\" href=\"/b/123456/epub\"/>"
+            +"</entry><entry><title>Раздел</title>"
+            +"<link rel=\"subsection\" type=\"application/atom+xml\" href=\"/opds/genres\"/>"
+            +"</entry></feed>";
+        JSONObject parsed=parseCatalog(xml.getBytes(StandardCharsets.UTF_8),"https://flibusta.is/opds");
+        JSONArray items=parsed.getJSONArray("items");
+        if(items.length()!=2||items.getJSONObject(0).getJSONArray("formats").length()!=1||
+           !"section".equals(items.getJSONObject(1).getString("kind")))
+            throw new Exception("Самопроверка парсера не пройдена");
+        JSONObject result=new JSONObject();result.put("status","Парсер работает на локальном образце OPDS. Интернет не проверялся.");
+        result.put("books",1);result.put("sections",1);return result;
     }
     private String filename(String title,String author,String format){
         String t=(title==null?"Книга":title).replaceAll("[\\p{Cntrl}/\\\\:*?\"<>|]"," ").trim();
@@ -299,7 +390,7 @@ public class MainActivity extends Activity {
                 }
             }
             String magic=new String(start,0,startSize,StandardCharsets.UTF_8).trim().toLowerCase(Locale.ROOT);
-            if(total<20||magic.startsWith("<!doctype")||magic.startsWith("<html")||magic.startsWith("<head"))throw new Exception("Получена HTML-страница или пустой файл вместо книги");
+            if(total<20||magic.startsWith("<!doctype")||magic.startsWith("<html")||magic.startsWith("<head")||magic.startsWith("<body"))throw new Exception("Источник вернул HTML-страницу вместо книги. Возможно, файл удалён или требуется вход.");
             if(format.equalsIgnoreCase("EPUB")&&!(start[0]=='P'&&start[1]=='K'))throw new Exception("Получен файл неожиданного формата");
             ContentValues done=new ContentValues();done.put(MediaStore.Downloads.IS_PENDING,0);
             getContentResolver().update(uri,done,null,null);
@@ -350,20 +441,82 @@ public class MainActivity extends Activity {
         }
         return s;
     }
+    private static String extForName(String filename){
+        String f=filename.toLowerCase(Locale.ROOT);
+        for(String ext:new String[]{".fb2.zip",".txt.zip",".html.zip",".rtf.zip",".epub",".fb2",".pdf",".txt",".mobi",".rtf",".html"})
+            if(f.endsWith(ext))return ext;
+        return "";
+    }
+    private JSONObject copyPickedFile(Uri source) throws Exception{
+        String srcName="Книга.fb2";
+        try(Cursor c=getContentResolver().query(source,new String[]{OpenableColumns.DISPLAY_NAME},null,null,null)){
+            if(c!=null && c.moveToFirst()){String value=c.getString(0);if(value!=null)srcName=value;}
+        }catch(Exception ignored){}
+        String ext=extForName(srcName);
+        if(ext.isEmpty())throw new Exception("Поддерживаются FB2, EPUB, PDF, TXT, RTF и их ZIP-архивы");
+        String filename=srcName.replaceAll("[\\p{Cntrl}/\\\\:*?\"<>|]","_");
+        Uri dst=null;long total=0;
+        try{
+            ContentValues v=new ContentValues();v.put(MediaStore.Downloads.DISPLAY_NAME,filename);
+            v.put(MediaStore.Downloads.MIME_TYPE,"application/octet-stream");
+            v.put(MediaStore.Downloads.RELATIVE_PATH,Environment.DIRECTORY_DOWNLOADS+"/Книжная полка");
+            v.put(MediaStore.Downloads.IS_PENDING,1);
+            dst=getContentResolver().insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI,v);
+            if(dst==null)throw new Exception("Нет доступа к сохранению файла");
+            try(InputStream in=getContentResolver().openInputStream(source);OutputStream out=getContentResolver().openOutputStream(dst)){
+                if(in==null||out==null)throw new Exception("Не удалось открыть файл");
+                byte[] buffer=new byte[32768];int n;
+                while((n=in.read(buffer))!=-1){total+=n;if(total>MAX_BOOK)throw new Exception("Слишком большой файл");out.write(buffer,0,n);}
+            }
+            if(total<5)throw new Exception("Файл пустой");
+            ContentValues done=new ContentValues();done.put(MediaStore.Downloads.IS_PENDING,0);
+            getContentResolver().update(dst,done,null,null);
+            String fmt=ext.contains("fb2")?"FB2":ext.contains("epub")?"EPUB":ext.contains("pdf")?"PDF":ext.contains("txt")?"TXT":ext.contains("rtf")?"RTF":"HTML";
+            JSONObject info=new JSONObject();info.put("name",filename);info.put("uri",dst.toString());info.put("format",fmt);
+            info.put("size",total);info.put("title",filename.substring(0,filename.length()-ext.length()));return info;
+        }catch(Exception e){if(dst!=null)getContentResolver().delete(dst,null,null);throw e;}
+    }
+    @Override protected void onActivityResult(int requestCode,int resultCode,Intent data){
+        super.onActivityResult(requestCode,resultCode,data);
+        if(requestCode!=FILE_PICKER)return;
+        if(resultCode!=RESULT_OK||data==null||data.getData()==null)return;
+        Uri picked=data.getData();
+        io.execute(()->{
+            try{JSONObject entry=copyPickedFile(picked);String js="window.__bookshelfImported("+entry.toString()+")";
+                runOnUiThread(()->{if(web!=null)web.evaluateJavascript(js,null);});
+            }catch(Exception e){toast("Не удалось добавить: "+friendly(e));}
+        });
+    }
     private class Bridge{
-        @JavascriptInterface public void feed(String path,String id){io.execute(()->{try{reply(id,true,new JSONObject(catalog(path)));}catch(Exception e){reply(id,false,e.getMessage());}});}
+        @JavascriptInterface public void selfTest(String id){io.execute(()->{try{reply(id,true,MainActivity.this.selfTest());}catch(Exception e){reply(id,false,friendly(e));}});}
+        @JavascriptInterface public void diagnose(String id){io.execute(()->{try{reply(id,true,MainActivity.this.diagnose());}catch(Exception e){reply(id,false,friendly(e));}});}
+        @JavascriptInterface public void feed(String path,String id){io.execute(()->{try{reply(id,true,new JSONObject(catalog(path)));}catch(Exception e){reply(id,false,friendly(e));}});}
         @JavascriptInterface public void search(String q,String type,String id){io.execute(()->{try{
             if(q.trim().length()<2||q.length()>140)throw new Exception("Введите хотя бы два символа");
             String t=Arrays.asList("books","authors","sequences").contains(type)?type:"books";
             String path="/opds/search?searchTerm="+URLEncoder.encode(q,"UTF-8")+"&searchType="+t;
             reply(id,true,new JSONObject(catalog(path)));
-        }catch(Exception e){reply(id,false,e.getMessage());}});}
-        @JavascriptInterface public void download(String url,String title,String author,String format,String id){io.execute(()->{try{reply(id,true,MainActivity.this.download(url,title,author,format,id));}catch(Exception e){reply(id,false,e.getMessage());}});}
-        @JavascriptInterface public void preview(String uri,String format,String id){io.execute(()->{try{reply(id,true,MainActivity.this.preview(uri,format));}catch(Exception e){reply(id,false,e.getMessage());}});}
+        }catch(Exception e){reply(id,false,friendly(e));}});}
+        @JavascriptInterface public void download(String url,String title,String author,String format,String id){io.execute(()->{try{reply(id,true,MainActivity.this.download(url,title,author,format,id));}catch(Exception e){reply(id,false,friendly(e));}});}
+        @JavascriptInterface public void preview(String uri,String format,String id){io.execute(()->{try{reply(id,true,MainActivity.this.preview(uri,format));}catch(Exception e){reply(id,false,friendly(e));}});}
+        @JavascriptInterface public void pickFile(){runOnUiThread(()->{
+            try{Intent picker=new Intent(Intent.ACTION_OPEN_DOCUMENT);picker.addCategory(Intent.CATEGORY_OPENABLE);
+                picker.setType("*/*");startActivityForResult(picker,FILE_PICKER);
+            }catch(Exception e){toast("Не удалось открыть выбор файлов");}
+        });}
         @JavascriptInterface public void openFile(String uri,String format){runOnUiThread(()->{try{
             Uri u=Uri.parse(uri);if(!"content".equals(u.getScheme())||!"media".equals(u.getAuthority()))throw new Exception();
             String mime=getContentResolver().getType(u);
-            if(mime==null)mime="application/octet-stream";
+            if(mime==null||"application/octet-stream".equals(mime)){
+                switch(format.toUpperCase(Locale.ROOT)){
+                    case "EPUB":mime="application/epub+zip";break;
+                    case "PDF":mime="application/pdf";break;
+                    case "FB2":mime="application/zip";break;
+                    case "TXT":mime="text/plain";break;
+                    case "HTML":mime="text/html";break;
+                    default:mime="application/octet-stream";
+                }
+            }
             Intent intent=new Intent(Intent.ACTION_VIEW);intent.setDataAndType(u,mime);intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION);
             startActivity(Intent.createChooser(intent,"Открыть книгу"));
         }catch(Exception e){toast("Для чтения этого формата установите подходящую читалку");}});}
