@@ -35,6 +35,6 @@ end = html.index('</script>',start)
 with tempfile.NamedTemporaryFile(mode='w',suffix='.js',encoding='utf-8') as f:
     f.write(html[start:end]); f.flush()
     subprocess.run(['node','--check',f.name],check=True)
-assert 'void selfTest(' in java and 'void diagnose(' in java
+assert 'JSONObject selfTest(' in java and 'JSONObject diagnose(' in java
 assert 'copyPickedFile(' in java
 print('Проверка JavaScript и функций диагностики пройдена.')
