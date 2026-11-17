@@ -251,7 +251,7 @@ public class MainActivity extends Activity {
             String summary=atomChild(entry,"summary");
             if(summary.isEmpty())summary=atomChild(entry,"content");
             String description=clean(summary);book.put("summary",description.substring(0,Math.min(4000,description.length())));
-            JSONArray formats=new JSONArray();String nav="",site="",bookId="";
+            JSONArray formats=new JSONArray();String nav="",site="",bookId="",authorId="";
             Matcher tagId=Pattern.compile("(?:tag:book:|/b/)(\\d{3,})").matcher(atomChild(entry,"id"));
             if(tagId.find())bookId=tagId.group(1);
             for(Node n=entry.getFirstChild();n!=null;n=n.getNextSibling()){
@@ -268,10 +268,31 @@ public class MainActivity extends Activity {
                     try{URL url=new URL(absolute);if(HOSTS.contains(url.getHost().toLowerCase(Locale.ROOT)))site=absolute;}
                     catch(Exception ignored){}
                 }
-                if((type.toLowerCase(Locale.ROOT).contains("application/atom+xml")&&
-                   ("subsection".equals(rel)||"collection".equals(rel)||"alternate".equals(rel))) ||
-                   "subsection".equals(rel)||"collection".equals(rel)){
-                    try{nav=checked(absolute,true).toString();}catch(Exception ignored){}
+                // OPDS navigation entries do not always use rel="subsection".
+                // For author and series search results, a valid Atom catalog link
+                // is stronger evidence of a folder than the presence of a summary.
+                boolean atomFeed=type.toLowerCase(Locale.ROOT).contains("application/atom+xml");
+                boolean navigationRel="subsection".equals(rel)||"collection".equals(rel)
+                    ||rel.contains("navigation")||rel.contains("subsection");
+                boolean catalogPath=false;
+                try{
+                    URL candidate=new URL(absolute);
+                    catalogPath=candidate.getPath().startsWith("/opds/")
+                        ||candidate.getPath().equals("/opds");
+                }catch(Exception ignored){}
+                if(catalogPath && (atomFeed||navigationRel||rel.isEmpty()||"alternate".equals(rel))){
+                    try{
+                        String candidate=checked(absolute,true).toString();
+                        // Never replace a useful navigation target with the feed's self link.
+                        if(!"self".equals(rel) && !"start".equals(rel))nav=candidate;
+                    }catch(Exception ignored){}
+                }
+                // Some author search feeds contain only an author profile URI.
+                // Do not treat an author profile as a downloadable book.
+                if(authorId.isEmpty() && (linkTitle.contains("книг")||linkTitle.contains("автора")
+                    ||"related".equals(rel)||"alternate".equals(rel))){
+                    Matcher a=Pattern.compile("(?i)/a/(\\d+)(?:/|$)").matcher(absolute);
+                    if(a.find())authorId=a.group(1);
                 }
                 String f=fmt(type,absolute);
                 if(f.isEmpty()&&rel.contains("acquisition"))f=fmt(linkTitle,absolute);
@@ -283,8 +304,22 @@ public class MainActivity extends Activity {
                     }catch(Exception ignored){}
                 }
             }
-            // The OPDS entry may be a catalog item with no acquisition links.
-            // Keep its details link instead of presenting a broken empty book card.
+            // Fallback only for a real author listing (not for a book's related author).
+            String entryId=atomChild(entry,"id");
+            boolean authorListing=sourceUrl.contains("searchType=authors")
+                ||sourceUrl.contains("/opds/author")
+                ||Pattern.compile("(?i)\\b\\d+\\s+книг(?:а|и)?\\b").matcher(description).find();
+            if(nav.isEmpty() && bookId.isEmpty() && formats.length()==0 && authorListing){
+                if(authorId.isEmpty()){
+                    Matcher a=Pattern.compile("(?i)(?:tag:author:|/a/)(\\d+)").matcher(entryId);
+                    if(a.find())authorId=a.group(1);
+                }
+                if(!authorId.isEmpty()){
+                    try{nav=checked(new URL(sourceUrl,"/opds/author/"+authorId).toString(),true).toString();}
+                    catch(Exception ignored){}
+                }
+            }
+            // Real book listings sometimes omit download links and offer details only.
             if(nav.isEmpty() && !bookId.isEmpty() && formats.length()==0){
                 try{nav=checked(new URL(sourceUrl,"/opds/book/"+bookId).toString(),true).toString();}
                 catch(Exception ignored){}
@@ -292,7 +327,10 @@ public class MainActivity extends Activity {
             book.put("formats",formats);book.put("navigation",nav);
             book.put("id",bookId);book.put("site",site);
             boolean section=formats.length()==0 && bookId.isEmpty() && !nav.isEmpty();
-            book.put("kind",section?"section":"book");
+            // An entry with neither navigation nor a book identifier/download is not a book.
+            // It must not expose a useless download dialog.
+            String kind=section?"section":(formats.length()>0||!bookId.isEmpty()?"book":"unavailable");
+            book.put("kind",kind);
             items.put(book);
         }
         return result;
@@ -334,14 +372,24 @@ public class MainActivity extends Activity {
             +"<link rel=\"http://opds-spec.org/acquisition\" type=\"application/epub+zip\" href=\"/b/123456/epub\"/>"
             +"</entry><entry><title>Раздел</title>"
             +"<link rel=\"subsection\" type=\"application/atom+xml\" href=\"/opds/genres\"/>"
+            +"</entry><entry><id>tag:author:87203</id><title>Шаттам Максим</title>"
+            +"<content>20 книг</content>"
+            +"<link rel=\"related\" type=\"application/atom+xml;profile=opds-catalog\" href=\"/opds/author/87203\"/>"
+            +"</entry><entry><id>tag:author:87204</id><title>Другой автор</title>"
+            +"<content>15 книг</content>"
+            +"<link rel=\"alternate\" type=\"text/html\" href=\"/a/87204\"/>"
             +"</entry></feed>";
         JSONObject parsed=parseCatalog(xml.getBytes(StandardCharsets.UTF_8),"https://flibusta.is/opds");
         JSONArray items=parsed.getJSONArray("items");
-        if(items.length()!=2||items.getJSONObject(0).getJSONArray("formats").length()!=1||
-           !"section".equals(items.getJSONObject(1).getString("kind")))
-            throw new Exception("Самопроверка парсера не пройдена");
-        JSONObject result=new JSONObject();result.put("status","Парсер работает на локальном образце OPDS. Интернет не проверялся.");
-        result.put("books",1);result.put("sections",1);return result;
+        if(items.length()!=4||items.getJSONObject(0).getJSONArray("formats").length()!=1||
+           !"section".equals(items.getJSONObject(1).getString("kind"))||
+           !"section".equals(items.getJSONObject(2).getString("kind"))||
+           !items.getJSONObject(2).getString("navigation").contains("/opds/author/87203")||
+           !"section".equals(items.getJSONObject(3).getString("kind"))||
+           !items.getJSONObject(3).getString("navigation").contains("/opds/author/87204"))
+            throw new Exception("Самопроверка парсера не пройдена: книга/автор/раздел");
+        JSONObject result=new JSONObject();result.put("status","Проверены книга, раздел, автор с 20 книгами и запасная ссылка автора. Интернет не проверялся.");
+        result.put("books",1);result.put("sections",3);return result;
     }
     private String filename(String title,String author,String format){
         String t=(title==null?"Книга":title).replaceAll("[\\p{Cntrl}/\\\\:*?\"<>|]"," ").trim();
