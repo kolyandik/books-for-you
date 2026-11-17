@@ -306,9 +306,9 @@ public class MainActivity extends Activity {
             }
             // Fallback only for a real author listing (not for a book's related author).
             String entryId=atomChild(entry,"id");
-            boolean authorListing=sourceUrl.contains("searchType=authors")
-                ||sourceUrl.contains("/opds/author")
-                ||Pattern.compile("(?i)\\b\\d+\\s+книг(?:а|и)?\\b").matcher(description).find();
+            boolean authorListing=sourceUrl.toExternalForm().contains("searchType=authors")
+    ||sourceUrl.toExternalForm().contains("/opds/author")
+    ||Pattern.compile("(?i)\\b\\d+\\s+книг(?:а|и)?\\b").matcher(description).find();
             if(nav.isEmpty() && bookId.isEmpty() && formats.length()==0 && authorListing){
                 if(authorId.isEmpty()){
                     Matcher a=Pattern.compile("(?i)(?:tag:author:|/a/)(\\d+)").matcher(entryId);
