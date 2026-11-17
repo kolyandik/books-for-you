@@ -128,7 +128,10 @@ public class MainActivity extends Activity {
         if(u.getUserInfo()!=null || (u.getPort()!=-1 && u.getPort()!=80 && u.getPort()!=443))throw new Exception("Недопустимая ссылка");
         String p=u.getPath();
         if(catalog && !(p.equals("/opds")||p.startsWith("/opds/")))throw new Exception("Ожидается адрес OPDS-каталога");
-        if(!catalog && !Pattern.matches("(?i)/(?:b/\\d+/(?:fb2|epub|mobi|pdf|txt|rtf|html|djvu)|opds/[a-zA-Z0-9_/%.-]+)",p))throw new Exception("Источник не предоставил допустимую ссылку для загрузки");
+        // Book URLs are taken only from actual acquisition links in the OPDS feed.
+        // Both /b/ID/format and /opds/b/ID/format are used by OPDS implementations.
+        if(!catalog && !Pattern.matches("(?i)/(?:b|opds/b)/\\d+/(?:fb2|epub|mobi|pdf|txt|rtf|html|djvu|download)(?:\\.zip)?/?",p))
+            throw new Exception("OPDS вернул неподдерживаемый путь к файлу: "+p);
         return u;
     }
     private HttpURLConnection connection(URL url,boolean catalog) throws Exception {
@@ -251,7 +254,9 @@ public class MainActivity extends Activity {
             String summary=atomChild(entry,"summary");
             if(summary.isEmpty())summary=atomChild(entry,"content");
             String description=clean(summary);book.put("summary",description.substring(0,Math.min(4000,description.length())));
-            JSONArray formats=new JSONArray();String nav="",site="",bookId="",authorId="";
+            JSONArray formats=new JSONArray();JSONArray linkDiagnostics=new JSONArray();
+            String nav="",site="",bookId="",authorId="";
+            int disabledLinks=0,rejectedLinks=0,acquisitionLinks=0;
             Matcher tagId=Pattern.compile("(?:tag:book:|/b/)(\\d{3,})").matcher(atomChild(entry,"id"));
             if(tagId.find())bookId=tagId.group(1);
             for(Node n=entry.getFirstChild();n!=null;n=n.getNextSibling()){
@@ -294,21 +299,53 @@ public class MainActivity extends Activity {
                     Matcher a=Pattern.compile("(?i)/a/(\\d+)(?:/|$)").matcher(absolute);
                     if(a.find())authorId=a.group(1);
                 }
+                // OPDS specifies the acquisition relation in `rel`. A link marked
+                // `acquisition/disabled` is NOT a downloadable book. Never fabricate
+                // a direct URL, and never treat a web/cover link as an acquisition.
+                String relation=rel.toLowerCase(Locale.ROOT);
+                boolean acquisition=relation.startsWith("http://opds-spec.org/acquisition")
+                    || "enclosure".equals(relation);
                 String f=fmt(type,absolute);
-                if(f.isEmpty()&&rel.contains("acquisition"))f=fmt(linkTitle,absolute);
-                if((rel.contains("acquisition")||(!f.isEmpty()&&!"alternate".equals(rel)))&&!f.isEmpty()){
-                    try{
-                        checked(absolute,false);
-                        JSONObject opt=new JSONObject();opt.put("format",f);opt.put("url",absolute);
-                        formats.put(opt);
-                    }catch(Exception ignored){}
+                boolean inferredFileLink=!f.isEmpty()&&!"alternate".equals(relation)
+                    && !relation.contains("image")
+                    && Pattern.compile("(?i)/(?:opds/)?b/\\d+/(?:fb2|epub|mobi|pdf|txt|rtf|djvu)(?:\\.zip)?/?(?:[?#]|$)").matcher(absolute).find();
+                String verdict="информационная ссылка";
+                if(acquisition || inferredFileLink){
+                    acquisitionLinks++;
+                    if(relation.contains("disabled")){
+                        disabledLinks++;
+                        verdict="скачивание отключено источником";
+                    }else if(f.isEmpty()){
+                        rejectedLinks++;
+                        verdict="не удалось определить формат";
+                    }else{
+                        try{
+                            checked(absolute,false);
+                            boolean duplicate=false;
+                            for(int k=0;k<formats.length();k++)
+                                if(absolute.equals(formats.getJSONObject(k).getString("url")))duplicate=true;
+                            if(!duplicate){
+                                JSONObject opt=new JSONObject();opt.put("format",f);opt.put("url",absolute);
+                                formats.put(opt);
+                            }
+                            verdict="доступный формат "+f;
+                        }catch(Exception e){rejectedLinks++;verdict="адрес отклонён: "+friendly(e);}
+                    }
+                }
+                if(linkDiagnostics.length()<24){
+                    JSONObject diagnostic=new JSONObject();
+                    diagnostic.put("rel",rel.substring(0,Math.min(140,rel.length())));
+                    diagnostic.put("type",type.substring(0,Math.min(100,type.length())));
+                    diagnostic.put("path",new URL(absolute).getPath());
+                    diagnostic.put("result",verdict);
+                    linkDiagnostics.put(diagnostic);
                 }
             }
             // Fallback only for a real author listing (not for a book's related author).
             String entryId=atomChild(entry,"id");
             boolean authorListing=sourceUrl.toExternalForm().contains("searchType=authors")
-    ||sourceUrl.toExternalForm().contains("/opds/author")
-    ||Pattern.compile("(?i)\\b\\d+\\s+книг(?:а|и)?\\b").matcher(description).find();
+                ||sourceUrl.toExternalForm().contains("/opds/author")
+                ||Pattern.compile("(?i)\\b\\d+\\s+книг(?:а|и)?\\b").matcher(description).find();
             if(nav.isEmpty() && bookId.isEmpty() && formats.length()==0 && authorListing){
                 if(authorId.isEmpty()){
                     Matcher a=Pattern.compile("(?i)(?:tag:author:|/a/)(\\d+)").matcher(entryId);
@@ -319,12 +356,18 @@ public class MainActivity extends Activity {
                     catch(Exception ignored){}
                 }
             }
-            // Real book listings sometimes omit download links and offer details only.
-            if(nav.isEmpty() && !bookId.isEmpty() && formats.length()==0){
-                try{nav=checked(new URL(sourceUrl,"/opds/book/"+bookId).toString(),true).toString();}
-                catch(Exception ignored){}
-            }
+            // Don't invent an OPDS detail URL: a legitimate detail link must have
+            // been explicitly supplied in the book's Atom entry.
             book.put("formats",formats);book.put("navigation",nav);
+            String formatStatus;
+            if(formats.length()>0)formatStatus="Доступные форматы указаны в OPDS-каталоге.";
+            else if(disabledLinks>0)formatStatus="Источник пометил ссылки как недоступные для загрузки.";
+            else if(rejectedLinks>0)formatStatus="Каталог передал ссылки, но приложение их не приняло. Откройте диагностику ссылок.";
+            else if(!nav.isEmpty())formatStatus="Форматы отсутствуют в списке. Есть ссылка на подробную OPDS-запись.";
+            else if(acquisitionLinks==0)formatStatus="В этой OPDS-записи нет ссылок на скачивание.";
+            else formatStatus="Источник не вернул поддерживаемый формат файла.";
+            book.put("formatStatus",formatStatus);
+            book.put("linkDiagnostics",linkDiagnostics);
             book.put("id",bookId);book.put("site",site);
             boolean section=formats.length()==0 && bookId.isEmpty() && !nav.isEmpty();
             // An entry with neither navigation nor a book identifier/download is not a book.
@@ -378,18 +421,22 @@ public class MainActivity extends Activity {
             +"</entry><entry><id>tag:author:87204</id><title>Другой автор</title>"
             +"<content>15 книг</content>"
             +"<link rel=\"alternate\" type=\"text/html\" href=\"/a/87204\"/>"
+            +"</entry><entry><id>tag:book:123457</id><title>Книга без файла</title>"
+            +"<link rel=\"http://opds-spec.org/acquisition/disabled\" type=\"disabled/fb2+zip\" href=\"/b/123457/download\"/>"
             +"</entry></feed>";
         JSONObject parsed=parseCatalog(xml.getBytes(StandardCharsets.UTF_8),"https://flibusta.is/opds");
         JSONArray items=parsed.getJSONArray("items");
-        if(items.length()!=4||items.getJSONObject(0).getJSONArray("formats").length()!=1||
+        if(items.length()!=5||items.getJSONObject(0).getJSONArray("formats").length()!=1||
            !"section".equals(items.getJSONObject(1).getString("kind"))||
            !"section".equals(items.getJSONObject(2).getString("kind"))||
            !items.getJSONObject(2).getString("navigation").contains("/opds/author/87203")||
            !"section".equals(items.getJSONObject(3).getString("kind"))||
-           !items.getJSONObject(3).getString("navigation").contains("/opds/author/87204"))
+           !items.getJSONObject(3).getString("navigation").contains("/opds/author/87204")||
+           items.getJSONObject(4).getJSONArray("formats").length()!=0||
+           !items.getJSONObject(4).getString("formatStatus").contains("недоступные"))
             throw new Exception("Самопроверка парсера не пройдена: книга/автор/раздел");
         JSONObject result=new JSONObject();result.put("status","Проверены книга, раздел, автор с 20 книгами и запасная ссылка автора. Интернет не проверялся.");
-        result.put("books",1);result.put("sections",3);return result;
+        result.put("books",2);result.put("sections",3);return result;
     }
     private String filename(String title,String author,String format){
         String t=(title==null?"Книга":title).replaceAll("[\\p{Cntrl}/\\\\:*?\"<>|]"," ").trim();
